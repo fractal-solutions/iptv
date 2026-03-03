@@ -332,7 +332,7 @@ export function App() {
         const num = parseInt(next, 10);
         if (num === SECRET_CHANNEL_CODE) {
           // Easter egg!
-          alert('ðŸ•¹ï¸ You found the secret! RetroVision says: IDDQD â€” God mode activated!');
+          alert('🕹️ You found the secret! Fractal TV says: IDDQD — God mode activated!');
         } else if (num >= 1 && num <= mergedChannels.length) {
           tuneToChannel(num - 1);
         }
@@ -540,7 +540,7 @@ export function App() {
           onClick: togglePower,
           tabIndex: 0,
           title: 'Power'
-        }, '◉'),
+        }, 'PWR'),
         h('button', {
           className: 'cinema-ctrl-btn',
           onClick: () => tuneToChannel(currentChannelIdx - 1),
@@ -775,7 +775,7 @@ export function App() {
             h('div', { className: 'controls-panel' },
 
               // Brand
-              h('div', { className: 'brand-plate' }, 'RETROVISION'),
+              h('div', { className: 'brand-plate' }, 'FRACTAL TV'),
 
               // Controls group
               h('div', { className: 'flex items-center gap-3 flex-wrap' },
@@ -835,7 +835,7 @@ export function App() {
                   tabIndex: 0,
                   title: 'Power'
                 },
-                  h('span', { style: { fontSize: '1.25rem' } }, '◉'),
+                  h('span', { style: { fontSize: '0.75rem', fontFamily: 'IBM Plex Mono, monospace', fontWeight: 700 } }, 'PWR'),
                   h('div', { className: 'power-led' + (poweredOn ? ' on' : '') })
                 )
               )

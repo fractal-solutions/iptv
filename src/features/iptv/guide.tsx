@@ -542,7 +542,7 @@ export function MenuOverlay({
                 marginBottom: "0.5rem",
               },
             },
-            "RETROVISION IPTV",
+            "FRACTAL TV",
           ),
           h(
             "div",
