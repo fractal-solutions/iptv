@@ -1,204 +1,28 @@
-// @ts-nocheck
+﻿// @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import "./index.css";
+import { MenuOverlay } from "./features/iptv/guide";
+import { RemoteControl } from "./features/iptv/remote";
+import { countryFlag } from "./features/iptv/format";
+import { CACHE, KEYBINDINGS, SECRET_CHANNEL_CODE, TIMEOUTS } from "./features/iptv/constants";
+import { loadLS, saveLS, STORAGE_KEYS } from "./features/iptv/storage";
+import { DEFAULT_SETTINGS_PREFS } from "./features/iptv/settings";
+import { destroyHls, playChannelStream, StaticNoise, TestPattern } from "./features/iptv/player";
+import { fetchIptvDataWithRetry } from "./features/iptv/api";
 
 const h = React.createElement;
-const Hls = window.Hls;
-
-// ─── Utility helpers ─────────────────────────────────────────────────
-function loadLS(key, fallback) {
-  try { const v = localStorage.getItem('retrovision-' + key); return v ? JSON.parse(v) : fallback; }
-  catch { return fallback; }
-}
-function saveLS(key, val) {
-  try { localStorage.setItem('retrovision-' + key, JSON.stringify(val)); } catch {}
-}
-
-function countryFlag(code) {
-  if (!code || code.length !== 2) return '🌐';
-  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
-}
-
-// ─── Spatial Navigation Hook ─────────────────────────────────────────
-// Manages arrow-key focus movement within a container of focusable elements
-function useSpatialNavigation(containerRef, active) {
-  useEffect(() => {
-    if (!active) return;
-
-    function getFocusables() {
-      if (!containerRef.current) return [];
-      return Array.from(containerRef.current.querySelectorAll(
-        'button, [tabindex="0"], input, select, .channel-card, .category-pill, .theme-card, .fav-star, .toggle-switch, .cinema-ctrl-btn'
-      )).filter(el => {
-        const style = window.getComputedStyle(el);
-        return style.display !== 'none' && style.visibility !== 'hidden' && !el.disabled;
-      });
-    }
-
-    function getRect(el) {
-      return el.getBoundingClientRect();
-    }
-
-    function findBestCandidate(current, direction, focusables) {
-      const currentRect = getRect(current);
-      const cx = currentRect.left + currentRect.width / 2;
-      const cy = currentRect.top + currentRect.height / 2;
-
-      let best = null;
-      let bestScore = Infinity;
-
-      focusables.forEach(el => {
-        if (el === current) return;
-        const r = getRect(el);
-        const ex = r.left + r.width / 2;
-        const ey = r.top + r.height / 2;
-        const dx = ex - cx;
-        const dy = ey - cy;
-
-        let valid = false;
-        let primaryDist = 0;
-        let secondaryDist = 0;
-
-        switch (direction) {
-          case 'ArrowUp':
-            valid = dy < -5;
-            primaryDist = Math.abs(dy);
-            secondaryDist = Math.abs(dx);
-            break;
-          case 'ArrowDown':
-            valid = dy > 5;
-            primaryDist = Math.abs(dy);
-            secondaryDist = Math.abs(dx);
-            break;
-          case 'ArrowLeft':
-            valid = dx < -5;
-            primaryDist = Math.abs(dx);
-            secondaryDist = Math.abs(dy);
-            break;
-          case 'ArrowRight':
-            valid = dx > 5;
-            primaryDist = Math.abs(dx);
-            secondaryDist = Math.abs(dy);
-            break;
-        }
-
-        if (valid) {
-          // Score: prioritize primary axis distance, penalize off-axis distance
-          const score = primaryDist + secondaryDist * 3;
-          if (score < bestScore) {
-            bestScore = score;
-            best = el;
-          }
-        }
-      });
-
-      return best;
-    }
-
-    function handleKey(e) {
-      const focusables = getFocusables();
-      if (focusables.length === 0) return;
-
-      const active = document.activeElement;
-      const isInput = active && (active.tagName === 'INPUT' || active.tagName === 'SELECT' || active.tagName === 'TEXTAREA');
-
-      // Skip spatial nav if typing in an input (unless it's arrow keys in select)
-      if (isInput && active.tagName !== 'SELECT' && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
-        return;
-      }
-
-      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
-        // If nothing focused in our container, focus first element
-        if (!containerRef.current.contains(active)) {
-          focusables[0]?.focus();
-          e.preventDefault();
-          return;
-        }
-
-        const candidate = findBestCandidate(active, e.key, focusables);
-        if (candidate) {
-          candidate.focus();
-          // Scroll into view if needed
-          candidate.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
-          e.preventDefault();
-        }
-      }
-
-      // Enter key activates focused element
-      if (e.key === 'Enter' && active && containerRef.current.contains(active)) {
-        if (active.tagName !== 'INPUT' && active.tagName !== 'SELECT') {
-          active.click();
-          e.preventDefault();
-        }
-      }
-    }
-
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [containerRef, active]);
-}
-
-// ─── Static / Snow Canvas ─────────────────────────────────────────────
-function StaticNoise({ show }) {
-  const canvasRef = useRef(null);
-  const frameRef = useRef(null);
-
-  useEffect(() => {
-    if (!show) { if (frameRef.current) cancelAnimationFrame(frameRef.current); return; }
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    let running = true;
-
-    function draw() {
-      if (!running) return;
-      const w = canvas.width = canvas.offsetWidth;
-      const ht = canvas.height = canvas.offsetHeight;
-
-      // In some layout transitions the canvas may be temporarily 0x0.
-      if (!w || !ht) {
-        frameRef.current = requestAnimationFrame(draw);
-        return;
-      }
-
-      const imageData = ctx.createImageData(w, ht);
-      const data = imageData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        const v = Math.random() * 255;
-        data[i] = v; data[i+1] = v; data[i+2] = v; data[i+3] = 200;
-      }
-      ctx.putImageData(imageData, 0, 0);
-      frameRef.current = requestAnimationFrame(draw);
-    }
-    draw();
-    return () => { running = false; if (frameRef.current) cancelAnimationFrame(frameRef.current); };
-  }, [show]);
-
-  if (!show) return null;
-  return h('canvas', { ref: canvasRef, className: 'static-canvas', style: { width: '100%', height: '100%' } });
-}
-
-// ─── Test Pattern (Channel 0) ─────────────────────────────────────────
-function TestPattern() {
-  const colors = ['#fff', '#ffff00', '#00ffff', '#00ff00', '#ff00ff', '#ff0000', '#0000ff', '#000'];
-  return h('div', { className: 'test-pattern' },
-    ...colors.map((c, i) => h('div', { key: i, className: 'test-bar', style: { background: c } }))
-  );
-}
-
-// ─── Main App ──────────────────────────────────────────────────────────
 export function App() {
   // State
-  const [poweredOn, setPoweredOn] = useState(loadLS('settings', {}).poweredOn !== false);
+  const [poweredOn, setPoweredOn] = useState(loadLS(STORAGE_KEYS.settings, {}).poweredOn !== false);
   const [powerAnim, setPowerAnim] = useState(null); // 'on' or 'off'
   const [channels, setChannels] = useState([]);
   const [streams, setStreams] = useState([]);
   const [categories, setCategories] = useState([]);
   const [countries, setCountries] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [currentChannelIdx, setCurrentChannelIdx] = useState(loadLS('settings', {}).lastChannel || 0);
-  const [volume, setVolume] = useState(loadLS('settings', {}).volume || 0.7);
-  const [muted, setMuted] = useState(loadLS('settings', {}).muted || false);
+  const [currentChannelIdx, setCurrentChannelIdx] = useState(loadLS(STORAGE_KEYS.settings, {}).lastChannel || 0);
+  const [volume, setVolume] = useState(loadLS(STORAGE_KEYS.settings, {}).volume || 0.7);
+  const [muted, setMuted] = useState(loadLS(STORAGE_KEYS.settings, {}).muted || false);
   const [showOsd, setShowOsd] = useState(false);
   const [showVolume, setShowVolume] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
@@ -206,9 +30,9 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [selectedCountry, setSelectedCountry] = useState('all');
-  const [favorites, setFavorites] = useState(loadLS('favorites', []));
-  const [history, setHistory] = useState(loadLS('history', []));
-  const [settings, setSettings] = useState(loadLS('settings-prefs', { scanlines: true, crtIntensity: 0.5, theme: 'wood' }));
+  const [favorites, setFavorites] = useState(loadLS(STORAGE_KEYS.favorites, []));
+  const [history, setHistory] = useState(loadLS(STORAGE_KEYS.history, []));
+  const [settings, setSettings] = useState(loadLS(STORAGE_KEYS.settingsPrefs, DEFAULT_SETTINGS_PREFS));
   const [streamError, setStreamError] = useState(false);
   const [isStatic, setIsStatic] = useState(true);
   const [showRemote, setShowRemote] = useState(false);
@@ -217,7 +41,9 @@ export function App() {
   const [isFramelessFullscreen, setIsFramelessFullscreen] = useState(false);
   const [antennaWobble, setAntennaWobble] = useState(false);
   const [showTestPattern, setShowTestPattern] = useState(false);
-  const [cinemaMode, setCinemaMode] = useState(loadLS('settings-prefs', {}).theme === 'cinema');
+  const [cinemaMode, setCinemaMode] = useState(loadLS(STORAGE_KEYS.settingsPrefs, {}).theme === 'cinema');
+  const [dataError, setDataError] = useState("");
+  const [reloadToken, setReloadToken] = useState(0);
   const [cinemaControlsVisible, setCinemaControlsVisible] = useState(false);
 
   const videoRef = useRef(null);
@@ -232,7 +58,7 @@ export function App() {
   const showCinemaControls = useCallback(() => {
     setCinemaControlsVisible(true);
     if (cinemaHideTimeout.current) clearTimeout(cinemaHideTimeout.current);
-    cinemaHideTimeout.current = setTimeout(() => setCinemaControlsVisible(false), 4000);
+    cinemaHideTimeout.current = setTimeout(() => setCinemaControlsVisible(false), TIMEOUTS.cinemaControlsHideMs);
   }, []);
 
   useEffect(() => {
@@ -300,15 +126,16 @@ export function App() {
 
   const currentChannel = mergedChannels[currentChannelIdx] || null;
 
-  // ─── Fetch IPTV data ─────────────────────────────────────────────
+  // â”€â”€â”€ Fetch IPTV data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
     async function fetchData() {
       setLoading(true);
+      setDataError("");
       try {
-        const cache = loadLS('channel-cache', null);
+        const cache = loadLS(STORAGE_KEYS.channelCache, null);
         const cacheAge = cache ? Date.now() - cache.cachedAt : Infinity;
 
-        if (cache && cacheAge < 3600000) {
+        if (cache && cacheAge < CACHE.channelCacheTtlMs) {
           setChannels(cache.channels);
           setStreams(cache.streams);
           setCategories(cache.categories || []);
@@ -317,105 +144,56 @@ export function App() {
           return;
         }
 
-        const [channelsRes, streamsRes, categoriesRes, countriesRes] = await Promise.all([
-          fetch('https://iptv-org.github.io/api/channels.json').then(r => r.json()),
-          fetch('https://iptv-org.github.io/api/streams.json').then(r => r.json()),
-          fetch('https://iptv-org.github.io/api/categories.json').then(r => r.json()).catch(() => []),
-          fetch('https://iptv-org.github.io/api/countries.json').then(r => r.json()).catch(() => [])
-        ]);
+        const { channels: channelsRes, streams: streamsRes, categories: categoriesRes, countries: countriesRes } =
+          await fetchIptvDataWithRetry();
 
         setChannels(channelsRes);
         setStreams(streamsRes);
         setCategories(categoriesRes);
         setCountries(countriesRes);
 
-        saveLS('channel-cache', {
+        saveLS(STORAGE_KEYS.channelCache, {
           channels: channelsRes,
           streams: streamsRes,
           categories: categoriesRes,
           countries: countriesRes,
-          cachedAt: Date.now()
+          cachedAt: Date.now(),
         });
       } catch (err) {
-        console.error('Failed to fetch IPTV data:', err);
+        console.error("Failed to fetch IPTV data:", err);
+        const staleCache = loadLS(STORAGE_KEYS.channelCache, null);
+        if (staleCache?.channels?.length && staleCache?.streams?.length) {
+          setChannels(staleCache.channels);
+          setStreams(staleCache.streams);
+          setCategories(staleCache.categories || []);
+          setCountries(staleCache.countries || []);
+          setDataError("Using cached channels. Live refresh failed.");
+        } else {
+          setDataError("Unable to load channel directory. Check network and retry.");
+        }
       }
       setLoading(false);
     }
     fetchData();
-  }, []);
+  }, [reloadToken]);
 
-  // ─── Play stream ──────────────────────────────────────────────────
-  const playStream = useCallback((channel) => {
-    if (!channel || !channel.streams || !channel.streams.length) {
-      setStreamError(true);
-      setIsStatic(true);
-      return;
-    }
+  // â”€â”€â”€ Play stream â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const playStream = useCallback(
+    channel => {
+      playChannelStream({
+        channel,
+        videoRef,
+        hlsRef,
+        setIsStatic,
+        setStreamError,
+        setShowTestPattern,
+        setAntennaWobble,
+      });
+    },
+    [videoRef, hlsRef, setIsStatic, setStreamError, setShowTestPattern, setAntennaWobble],
+  );
 
-    setStreamError(false);
-    setIsStatic(true);
-    setShowTestPattern(false);
-
-    const video = videoRef.current;
-    if (!video) return;
-
-    // Brief static effect
-    setTimeout(() => {
-      const streamUrl = channel.streams[0].url;
-
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
-
-      if (Hls.isSupported() && streamUrl.includes('.m3u8')) {
-        const hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: true,
-          maxBufferLength: 30,
-          maxMaxBufferLength: 60,
-        });
-        hlsRef.current = hls;
-        hls.loadSource(streamUrl);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          video.play().catch(() => {});
-          setIsStatic(false);
-          setStreamError(false);
-        });
-        hls.on(Hls.Events.ERROR, (event, data) => {
-          if (data.fatal) {
-            setStreamError(true);
-            setIsStatic(true);
-            setAntennaWobble(true);
-            setTimeout(() => setAntennaWobble(false), 1000);
-          }
-        });
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = streamUrl;
-        video.addEventListener('loadedmetadata', () => {
-          video.play().catch(() => {});
-          setIsStatic(false);
-        }, { once: true });
-        video.addEventListener('error', () => {
-          setStreamError(true);
-          setIsStatic(true);
-        }, { once: true });
-      } else {
-        video.src = streamUrl;
-        video.addEventListener('canplay', () => {
-          video.play().catch(() => {});
-          setIsStatic(false);
-        }, { once: true });
-        video.addEventListener('error', () => {
-          setStreamError(true);
-          setIsStatic(true);
-        }, { once: true });
-      }
-    }, 300);
-  }, []);
-
-  // ─── Channel change ───────────────────────────────────────────────
+  // â”€â”€â”€ Channel change â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const tuneToChannel = useCallback((idx) => {
     if (idx < 0) idx = mergedChannels.length - 1;
     if (idx >= mergedChannels.length) idx = 0;
@@ -423,12 +201,12 @@ export function App() {
     if (idx === -1 || mergedChannels.length === 0) return;
 
     setCurrentChannelIdx(idx);
-    saveLS('settings', { ...loadLS('settings', {}), lastChannel: idx });
+    saveLS(STORAGE_KEYS.settings, { ...loadLS(STORAGE_KEYS.settings, {}), lastChannel: idx });
 
     // Show OSD
     setShowOsd(true);
     if (osdTimeout.current) clearTimeout(osdTimeout.current);
-    osdTimeout.current = setTimeout(() => setShowOsd(false), 3000);
+    osdTimeout.current = setTimeout(() => setShowOsd(false), TIMEOUTS.osdHideMs);
 
     // Add to history
     const ch = mergedChannels[idx];
@@ -436,7 +214,7 @@ export function App() {
       const newHistory = [{ id: ch.id, name: ch.name, timestamp: Date.now() },
         ...history.filter(h => h.id !== ch.id)].slice(0, 50);
       setHistory(newHistory);
-      saveLS('history', newHistory);
+      saveLS(STORAGE_KEYS.history, newHistory);
     }
 
     // Check test pattern (channel 0)
@@ -447,7 +225,7 @@ export function App() {
     playStream(mergedChannels[idx]);
   }, [mergedChannels, playStream, history]);
 
-  // ─── Start playing when channels load ──────────────────────────
+  // â”€â”€â”€ Start playing when channels load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
     if (mergedChannels.length > 0 && poweredOn) {
       const idx = Math.min(currentChannelIdx, mergedChannels.length - 1);
@@ -456,31 +234,31 @@ export function App() {
     }
   }, [mergedChannels.length, poweredOn]);
 
-  // ─── Volume ─────────────────────────────────────────────────────
+  // â”€â”€â”€ Volume â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.volume = muted ? 0 : volume;
     }
-    saveLS('settings', { ...loadLS('settings', {}), volume, muted });
+    saveLS(STORAGE_KEYS.settings, { ...loadLS(STORAGE_KEYS.settings, {}), volume, muted });
   }, [volume, muted]);
 
   const adjustVolume = useCallback((delta) => {
     setVolume(v => Math.max(0, Math.min(1, v + delta)));
     setShowVolume(true);
     if (volumeTimeout.current) clearTimeout(volumeTimeout.current);
-    volumeTimeout.current = setTimeout(() => setShowVolume(false), 1500);
+    volumeTimeout.current = setTimeout(() => setShowVolume(false), TIMEOUTS.volumeHideMs);
   }, []);
 
-  // ─── Power toggle ──────────────────────────────────────────────
+  // â”€â”€â”€ Power toggle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const togglePower = useCallback(() => {
     if (poweredOn) {
       setPowerAnim('off');
       setTimeout(() => {
         setPoweredOn(false);
         setPowerAnim(null);
-        if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+        destroyHls(hlsRef);
         if (videoRef.current) videoRef.current.src = '';
-      }, 500);
+      }, TIMEOUTS.powerOffMs);
     } else {
       setPoweredOn(true);
       setPowerAnim('on');
@@ -489,32 +267,32 @@ export function App() {
         setPowerAnim(null);
         setDegaussing(false);
         if (mergedChannels.length > 0) playStream(mergedChannels[currentChannelIdx]);
-      }, 800);
+      }, TIMEOUTS.powerOnMs);
     }
-    saveLS('settings', { ...loadLS('settings', {}), poweredOn: !poweredOn });
+    saveLS(STORAGE_KEYS.settings, { ...loadLS(STORAGE_KEYS.settings, {}), poweredOn: !poweredOn });
   }, [poweredOn, mergedChannels, currentChannelIdx, playStream]);
 
-  // ─── Favorites ─────────────────────────────────────────────────
+  // â”€â”€â”€ Favorites â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const toggleFavorite = useCallback((channelId) => {
     setFavorites(prev => {
       const next = prev.includes(channelId) ? prev.filter(id => id !== channelId) : [...prev, channelId];
-      saveLS('favorites', next);
+      saveLS(STORAGE_KEYS.favorites, next);
       return next;
     });
   }, []);
 
-  // ─── Keyboard shortcuts (when menu is NOT open) ────────────────
+  // â”€â”€â”€ Keyboard shortcuts (when menu is NOT open) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
     function handleKey(e) {
       if (!poweredOn) {
-        if (e.key === 'Enter' || e.key === ' ') togglePower();
+        if (KEYBINDINGS.power.includes(e.key)) togglePower();
         return;
       }
       if (showMenu && e.key === 'Escape') { setShowMenu(false); return; }
 
       // If menu is open, let spatial navigation handle arrows
       if (showMenu) {
-        if (e.key === 'Escape' || e.key === 'Backspace') {
+        if (KEYBINDINGS.closeMenu.includes(e.key)) {
           setShowMenu(false);
           e.preventDefault();
         }
@@ -526,9 +304,15 @@ export function App() {
         case 'ArrowDown': e.preventDefault(); tuneToChannel(currentChannelIdx - 1); break;
         case 'ArrowRight': e.preventDefault(); adjustVolume(0.05); break;
         case 'ArrowLeft': e.preventDefault(); adjustVolume(-0.05); break;
-        case 'm': case 'M': setMuted(m => !m); break;
-        case 'g': case 'G': case 'Enter': setShowMenu(v => !v); break;
-        case 'Escape': case 'Backspace': setShowMenu(false); break;
+        case 'm': case 'M':
+          if (KEYBINDINGS.mute.includes(e.key)) setMuted(m => !m);
+          break;
+        case 'g': case 'G': case 'Enter':
+          if (KEYBINDINGS.menuToggle.includes(e.key)) setShowMenu(v => !v);
+          break;
+        case 'Escape': case 'Backspace':
+          if (KEYBINDINGS.closeMenu.includes(e.key)) setShowMenu(false);
+          break;
         default:
           if (/^[0-9]$/.test(e.key)) {
             handleNumberInput(e.key);
@@ -539,26 +323,26 @@ export function App() {
     return () => window.removeEventListener('keydown', handleKey);
   }, [poweredOn, currentChannelIdx, showMenu, togglePower, tuneToChannel, adjustVolume]);
 
-  // ─── Number input (direct channel entry) ────────────────────────
+  // â”€â”€â”€ Number input (direct channel entry) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const handleNumberInput = useCallback((digit) => {
     setNumberBuffer(prev => {
       const next = (prev + digit).slice(-4);
       if (numberTimeout.current) clearTimeout(numberTimeout.current);
       numberTimeout.current = setTimeout(() => {
         const num = parseInt(next, 10);
-        if (num === 1337) {
+        if (num === SECRET_CHANNEL_CODE) {
           // Easter egg!
-          alert('🕹️ You found the secret! RetroVision says: IDDQD — God mode activated!');
+          alert('ðŸ•¹ï¸ You found the secret! RetroVision says: IDDQD â€” God mode activated!');
         } else if (num >= 1 && num <= mergedChannels.length) {
           tuneToChannel(num - 1);
         }
         setNumberBuffer('');
-      }, 1500);
+      }, TIMEOUTS.numberCommitMs);
       return next;
     });
   }, [mergedChannels.length, tuneToChannel]);
 
-  // ─── Frameless fullscreen ──────────────────────────────────────
+  // â”€â”€â”€ Frameless fullscreen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const screenContainerRef = useRef(null);
   const fullscreenWrapperRef = useRef(null);
   const toggleFramelessFullscreen = useCallback(() => {
@@ -600,10 +384,10 @@ export function App() {
     };
   }, []);
 
-  // ─── Save settings ─────────────────────────────────────────────
-  useEffect(() => { saveLS('settings-prefs', settings); }, [settings]);
+  // â”€â”€â”€ Save settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  useEffect(() => { saveLS(STORAGE_KEYS.settingsPrefs, settings); }, [settings]);
 
-  // ─── Category list ─────────────────────────────────────────────
+  // â”€â”€â”€ Category list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const categoryList = useMemo(() => {
     const cats = new Set();
     mergedChannels.forEach(ch => {
@@ -628,10 +412,11 @@ export function App() {
     return map;
   }, [countries]);
 
-  // ─── Theme class ───────────────────────────────────────────────
+  // â”€â”€â”€ Theme class â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const themeClass = settings.theme === 'plastic' ? 'theme-plastic' : settings.theme === 'silver' ? 'theme-silver' : settings.theme === 'midnight' ? 'theme-midnight' : settings.theme === 'walnut' ? 'theme-walnut' : '';
+  const retryChannelLoad = useCallback(() => setReloadToken(v => v + 1), []);
 
-  // ─── Render ─────────────────────────────────────────────────────
+  // â”€â”€â”€ Render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   // Cinema mode render
   if (cinemaMode) {
@@ -666,7 +451,7 @@ export function App() {
           poweredOn && streamError && h('div', { className: 'no-signal' },
             h('div', { className: 'no-signal-text' }, 'NO SIGNAL'),
             h('div', { style: { fontFamily: 'VT323, monospace', fontSize: '0.875rem', color: '#666', marginTop: '0.5rem' } },
-              currentChannel ? currentChannel.name + ' — Stream unavailable' : 'No channel selected'
+              currentChannel ? currentChannel.name + ' â€” Stream unavailable' : 'No channel selected'
             )
           ),
 
@@ -679,7 +464,7 @@ export function App() {
                 countryFlag(currentChannel.country), ' ', currentChannel.name
               ),
               h('div', { className: 'osd-channel-meta' },
-                (currentChannel.categories || []).join(' · '), ' — ',
+                (currentChannel.categories || []).join(' Â· '), ' â€” ',
                 new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
               )
             )
@@ -755,7 +540,7 @@ export function App() {
           onClick: togglePower,
           tabIndex: 0,
           title: 'Power'
-        }, '⏻'),
+        }, '◉'),
         h('button', {
           className: 'cinema-ctrl-btn',
           onClick: () => tuneToChannel(currentChannelIdx - 1),
@@ -809,11 +594,47 @@ export function App() {
           background: 'rgba(0,0,0,0.7)', padding: '0.5rem 1.5rem',
           borderRadius: '0.5rem', zIndex: 50
         }
-      }, numberBuffer)
+      }, numberBuffer),
+
+      dataError && h('div', {
+        style: {
+          position: 'fixed',
+          left: '50%',
+          bottom: '1rem',
+          transform: 'translateX(-50%)',
+          zIndex: 60,
+          maxWidth: 'min(90vw, 42rem)',
+          background: 'rgba(0,0,0,0.82)',
+          border: '1px solid rgba(255,120,120,0.45)',
+          color: '#f2dede',
+          padding: '0.6rem 0.8rem',
+          borderRadius: '0.5rem',
+          fontFamily: 'IBM Plex Mono, monospace',
+          fontSize: '0.85rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.75rem'
+        }
+      },
+        h('span', null, dataError),
+        h('button', {
+          onClick: retryChannelLoad,
+          tabIndex: 0,
+          style: {
+            border: '1px solid #00ff88',
+            color: '#00ff88',
+            background: 'rgba(0,0,0,0.25)',
+            padding: '0.25rem 0.6rem',
+            borderRadius: '0.35rem',
+            fontFamily: 'IBM Plex Mono, monospace',
+            cursor: 'pointer'
+          }
+        }, 'Retry')
+      )
     );
   }
 
-  // ─── Skeuomorphic (default) render ─────────────────────────────
+  // â”€â”€â”€ Skeuomorphic (default) render â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const screenContent = h('div', {
     ref: screenContainerRef,
     className: 'screen-container' + (poweredOn ? ' powered-on' : '') + (isFramelessFullscreen ? ' frameless-screen' : '')
@@ -845,7 +666,7 @@ export function App() {
       poweredOn && streamError && h('div', { className: 'no-signal' },
         h('div', { className: 'no-signal-text' }, 'NO SIGNAL'),
         h('div', { style: { fontFamily: 'VT323, monospace', fontSize: '0.875rem', color: '#666', marginTop: '0.5rem' } },
-          currentChannel ? currentChannel.name + ' — Stream unavailable' : 'No channel selected'
+          currentChannel ? currentChannel.name + ' â€” Stream unavailable' : 'No channel selected'
         )
       ),
 
@@ -879,7 +700,7 @@ export function App() {
             countryFlag(currentChannel.country), ' ', currentChannel.name
           ),
           h('div', { className: 'osd-channel-meta' },
-            (currentChannel.categories || []).join(' · '), ' — ',
+            (currentChannel.categories || []).join(' Â· '), ' â€” ',
             new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           )
         )
@@ -1014,7 +835,7 @@ export function App() {
                   tabIndex: 0,
                   title: 'Power'
                 },
-                  h('span', { style: { fontSize: '1.25rem' } }, '⏻'),
+                  h('span', { style: { fontSize: '1.25rem' } }, '◉'),
                   h('div', { className: 'power-led' + (poweredOn ? ' on' : '') })
                 )
               )
@@ -1028,10 +849,41 @@ export function App() {
       h('span', { style: { color: '#00ff88', fontFamily: 'VT323, monospace', fontSize: '1.125rem' } }, 'Loading channels...')
     ),
 
+    dataError && h('div', {
+      style: {
+        marginTop: '0.75rem',
+        background: 'rgba(80,0,0,0.35)',
+        border: '1px solid rgba(255,120,120,0.45)',
+        color: '#f2dede',
+        borderRadius: '0.5rem',
+        padding: '0.6rem 0.75rem',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.75rem',
+        fontFamily: 'IBM Plex Mono, monospace',
+        fontSize: '0.8rem'
+      }
+    },
+      h('span', null, dataError),
+      h('button', {
+        onClick: retryChannelLoad,
+        tabIndex: 0,
+        style: {
+          border: '1px solid #00ff88',
+          color: '#00ff88',
+          background: 'rgba(0,0,0,0.25)',
+          padding: '0.25rem 0.6rem',
+          borderRadius: '0.35rem',
+          fontFamily: 'IBM Plex Mono, monospace',
+          cursor: 'pointer'
+        }
+      }, 'Retry')
+    ),
+
     // Channel count
     !loading && mergedChannels.length > 0 && h('div', {
       style: { color: '#555', fontFamily: 'VT323, monospace', fontSize: '0.875rem', marginTop: '0.75rem' }
-    }, mergedChannels.length + ' channels available • Press G for guide • Arrow keys to surf'),
+    }, mergedChannels.length + ' channels available â€¢ Press G for guide â€¢ Arrow keys to surf'),
 
     // Mobile remote toggle
     !isFramelessFullscreen && h('button', {
@@ -1069,351 +921,3 @@ export function App() {
   );
 }
 
-// ─── Menu Overlay Component ────────────────────────────────────────
-function MenuOverlay({
-  tab, setTab, channels, allChannels, categories, countries,
-  countryNameMap,
-  selectedCategory, setSelectedCategory, selectedCountry, setSelectedCountry,
-  searchQuery, setSearchQuery, favorites, toggleFavorite,
-  currentChannelIdx, onSelectChannel, onClose, settings, setSettings, history
-}) {
-  const menuRef = useRef(null);
-
-  // Enable spatial navigation inside menu
-  useSpatialNavigation(menuRef, true);
-
-  const favoriteChannels = useMemo(() =>
-    allChannels.filter(ch => favorites.includes(ch.id)),
-    [allChannels, favorites]
-  );
-
-  const recentChannels = useMemo(() => {
-    return history.slice(0, 10).map(h => allChannels.find(ch => ch.id === h.id)).filter(Boolean);
-  }, [history, allChannels]);
-
-  return h('div', { ref: menuRef, className: 'menu-overlay' },
-
-    // Top bar
-    h('div', { className: 'menu-topbar flex items-center justify-between p-3 border-b border-white/10' },
-      h('div', { className: 'flex gap-1' },
-        ['guide', 'favorites', 'recent', 'settings'].map(t =>
-          h('button', {
-            key: t,
-            className: 'category-pill' + (tab === t ? ' active' : ''),
-            onClick: () => setTab(t),
-            tabIndex: 0
-          }, t.charAt(0).toUpperCase() + t.slice(1))
-        )
-      ),
-      h('button', {
-        onClick: onClose,
-        tabIndex: 0,
-        style: { color: '#888', fontSize: '1.5rem', background: 'none', border: 'none', cursor: 'pointer', padding: '0.25rem 0.5rem' }
-      }, '✕')
-    ),
-
-    // Guide tab
-    tab === 'guide' && h('div', { className: 'guide-panel p-3', style: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
-      // Search
-      h('input', {
-        className: 'retro-search guide-search',
-        placeholder: '🔍 Search channels...',
-        value: searchQuery,
-        onChange: (e) => setSearchQuery(e.target.value),
-        tabIndex: 0
-      }),
-
-      // Category filters
-      h('div', { className: 'guide-categories flex gap-1 flex-wrap', style: { maxHeight: '3.75rem', overflowY: 'auto' } },
-        categories.slice(0, 20).map(cat =>
-          h('button', {
-            key: cat,
-            className: 'category-pill' + (selectedCategory === cat ? ' active' : ''),
-            onClick: () => setSelectedCategory(cat),
-            tabIndex: 0
-          }, cat === 'all' ? 'All' : cat)
-        )
-      ),
-
-      // Country filter
-      h('div', { className: 'guide-country' },
-        h('select', {
-          value: selectedCountry,
-          onChange: (e) => setSelectedCountry(e.target.value),
-          tabIndex: 0,
-          style: {
-            background: 'rgba(0,0,0,0.5)', border: '0.0625rem solid rgba(255,255,255,0.15)',
-            borderRadius: '0.375rem', padding: '0.375rem 0.625rem', color: '#00ff88',
-            fontFamily: 'VT323, monospace', fontSize: '1rem', width: '12.5rem', outline: 'none'
-          }
-        },
-          h('option', { value: 'all' }, '🌐 All Countries'),
-          ...countries.filter(c => c !== 'all').map(c =>
-            h('option', { key: c, value: c }, countryFlag(c) + ' ' + (countryNameMap && countryNameMap[c] ? countryNameMap[c] : c.toUpperCase()))
-          )
-        )
-      ),
-
-      // Channel list
-      h('div', { className: 'guide-channel-list', style: { flex: 1, overflowY: 'auto' } },
-        channels.length === 0 && h('div', {
-          style: { color: '#666', fontFamily: 'VT323, monospace', fontSize: '1rem', textAlign: 'center', padding: '1.25rem' }
-        }, 'No channels found'),
-        channels.slice(0, 100).map(ch =>
-          h('div', {
-            key: ch.id,
-            className: 'channel-card' + (allChannels[currentChannelIdx]?.id === ch.id ? ' active' : ''),
-            onClick: () => onSelectChannel(ch),
-            tabIndex: 0,
-            role: 'button',
-            style: { marginBottom: '0.25rem' }
-          },
-            // Channel number
-            h('div', {
-              style: {
-                fontFamily: 'Orbitron, monospace', fontSize: '0.6875rem', color: '#00ff88',
-                minWidth: '2.25rem', textAlign: 'center'
-              }
-            }, String(ch.channelNumber).padStart(3, '0')),
-
-            // Logo
-            ch.logo ? h('img', {
-              src: ch.logo,
-              style: { width: '2rem', height: '2rem', objectFit: 'contain', borderRadius: '0.25rem', background: 'rgba(255,255,255,0.1)' },
-              onError: (e) => { e.target.style.display = 'none'; }
-            }) : h('div', {
-              style: { width: '2rem', height: '2rem', borderRadius: '0.25rem', background: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.875rem' }
-            }, '📺'),
-
-            // Info
-            h('div', { className: 'flex-1 min-w-0' },
-              h('div', { style: { color: '#eee', fontSize: '0.875rem', fontFamily: 'IBM Plex Mono, monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } },
-                countryFlag(ch.country), ' ', ch.name
-              ),
-              h('div', { style: { color: '#666', fontSize: '0.6875rem', fontFamily: 'IBM Plex Mono, monospace' } },
-                (ch.categories || []).join(', ')
-              )
-            ),
-
-            // Favorite star
-            h('span', {
-              className: 'fav-star' + (favorites.includes(ch.id) ? ' active' : ''),
-              onClick: (e) => { e.stopPropagation(); toggleFavorite(ch.id); },
-              tabIndex: 0,
-              role: 'button',
-              'aria-label': favorites.includes(ch.id) ? 'Remove from favorites' : 'Add to favorites'
-            }, favorites.includes(ch.id) ? '★' : '☆')
-          )
-        ),
-        channels.length > 100 && h('div', {
-          style: { color: '#555', fontFamily: 'VT323, monospace', fontSize: '0.875rem', textAlign: 'center', padding: '0.625rem' }
-        }, 'Showing first 100 of ' + channels.length + ' channels. Use search to narrow down.')
-      )
-    ),
-
-    // Favorites tab
-    tab === 'favorites' && h('div', { className: 'p-3' },
-      h('div', { style: { fontFamily: 'VT323, monospace', fontSize: '1.25rem', color: '#ffd700', marginBottom: '0.75rem' } },
-        '★ Your Favorites (' + favoriteChannels.length + ')'
-      ),
-      favoriteChannels.length === 0 && h('div', {
-        style: { color: '#666', fontFamily: 'VT323, monospace', fontSize: '1rem', textAlign: 'center', padding: '2.5rem' }
-      }, 'No favorites yet! Star channels in the Guide to add them here.'),
-      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(8.75rem, 1fr))', gap: '0.5rem' } },
-        favoriteChannels.map(ch =>
-          h('div', {
-            key: ch.id,
-            className: 'channel-card',
-            onClick: () => onSelectChannel(ch),
-            tabIndex: 0,
-            role: 'button',
-            style: { flexDirection: 'column', textAlign: 'center', padding: '0.75rem' }
-          },
-            ch.logo ? h('img', {
-              src: ch.logo,
-              style: { width: '3rem', height: '3rem', objectFit: 'contain', margin: '0 auto 0.5rem', borderRadius: '0.375rem', background: 'rgba(255,255,255,0.1)' },
-              onError: (e) => { e.target.style.display = 'none'; }
-            }) : h('div', {
-              style: { width: '3rem', height: '3rem', margin: '0 auto 0.5rem', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.5rem' }
-            }, '📺'),
-            h('div', { style: { color: '#ddd', fontSize: '0.75rem', fontFamily: 'IBM Plex Mono, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-              ch.name
-            )
-          )
-        )
-      )
-    ),
-
-    // Recent tab
-    tab === 'recent' && h('div', { className: 'p-3' },
-      h('div', { style: { fontFamily: 'VT323, monospace', fontSize: '1.25rem', color: '#00ccff', marginBottom: '0.75rem' } },
-        '🕐 Recently Watched'
-      ),
-      recentChannels.length === 0 && h('div', {
-        style: { color: '#666', fontFamily: 'VT323, monospace', fontSize: '1rem', textAlign: 'center', padding: '2.5rem' }
-      }, 'No watch history yet. Start surfing!'),
-      recentChannels.map(ch =>
-        h('div', {
-          key: ch.id,
-          className: 'channel-card',
-          onClick: () => onSelectChannel(ch),
-          tabIndex: 0,
-          role: 'button',
-          style: { marginBottom: '0.25rem' }
-        },
-          ch.logo ? h('img', {
-            src: ch.logo,
-            style: { width: '2rem', height: '2rem', objectFit: 'contain', borderRadius: '0.25rem', background: 'rgba(255,255,255,0.1)' },
-            onError: (e) => { e.target.style.display = 'none'; }
-          }) : null,
-          h('div', { className: 'flex-1' },
-            h('div', { style: { color: '#eee', fontSize: '0.875rem', fontFamily: 'IBM Plex Mono, monospace' } },
-              countryFlag(ch.country), ' ', ch.name
-            )
-          )
-        )
-      )
-    ),
-
-    // Settings tab
-    tab === 'settings' && h('div', { className: 'p-3' },
-      h('div', { style: { fontFamily: 'VT323, monospace', fontSize: '1.25rem', color: '#ff8800', marginBottom: '1rem' } },
-        '⚙ Settings'
-      ),
-
-      // Scanlines toggle
-      h('div', { className: 'settings-item' },
-        h('div', null,
-          h('div', { style: { color: '#ddd', fontSize: '0.875rem', fontFamily: 'IBM Plex Mono, monospace' } }, 'Scanlines'),
-          h('div', { style: { color: '#666', fontSize: '0.75rem' } }, 'Classic CRT scanline overlay')
-        ),
-        h('div', {
-          className: 'toggle-switch' + (settings.scanlines ? ' on' : ''),
-          onClick: () => setSettings(s => ({ ...s, scanlines: !s.scanlines })),
-          tabIndex: 0,
-          role: 'switch',
-          'aria-checked': settings.scanlines
-        })
-      ),
-
-      // Theme selector
-      h('div', { className: 'settings-item', style: { flexDirection: 'column', alignItems: 'flex-start', gap: '0.625rem' } },
-        h('div', null,
-          h('div', { style: { color: '#ddd', fontSize: '0.875rem', fontFamily: 'IBM Plex Mono, monospace' } }, 'TV Frame Theme'),
-          h('div', { style: { color: '#666', fontSize: '0.75rem' } }, 'Choose your retro style')
-        ),
-        h('div', { className: 'theme-selector-grid' },
-          [
-            { id: 'wood', label: 'Oak', icon: '🪵', desc: 'Classic 70s' },
-            { id: 'walnut', label: 'Walnut', icon: '🌰', desc: 'Dark wood' },
-            { id: 'plastic', label: 'Plastic', icon: '📺', desc: '90s black' },
-            { id: 'silver', label: 'Silver', icon: '🪩', desc: 'Modern' },
-            { id: 'midnight', label: 'Midnight', icon: '🌙', desc: 'Dark luxe' },
-            { id: 'cinema', label: 'Cinema', icon: '🎬', desc: 'Frameless' }
-          ].map(theme =>
-            h('button', {
-              key: theme.id,
-              className: 'theme-card' + (settings.theme === theme.id ? ' active' : ''),
-              onClick: () => setSettings(s => ({ ...s, theme: theme.id })),
-              tabIndex: 0
-            },
-              h('span', { style: { fontSize: '1.25rem' } }, theme.icon),
-              h('span', { style: { fontSize: '0.75rem', fontWeight: 700, color: settings.theme === theme.id ? '#00ff88' : '#ccc' } }, theme.label),
-              h('span', { style: { fontSize: '0.625rem', color: '#666' } }, theme.desc)
-            )
-          )
-        )
-      ),
-
-      // About
-      h('div', { style: { marginTop: '1.5rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '0.5rem' } },
-        h('div', { style: { fontFamily: 'Orbitron, sans-serif', fontWeight: 900, fontSize: '1rem', color: '#00ff88', marginBottom: '0.5rem' } }, 'RETROVISION IPTV'),
-        h('div', { style: { color: '#666', fontSize: '0.8125rem', fontFamily: 'IBM Plex Mono, monospace', lineHeight: '1.6' } },
-          'A skeuomorphic IPTV client that looks like a real TV.',
-          h('br'),
-          'Channel data from iptv-org.github.io',
-          h('br'),
-          'Built with React, HLS.js, and way too much CSS.',
-          h('br'),
-          h('br'),
-          '🎮 Easter egg: type 1337 on the number pad (4 digits supported!)',
-          h('br'),
-          h('br'),
-          '📺 10-foot UI: Use arrow keys on your TV remote to navigate!',
-          h('br'),
-          '🎬 Cinema theme: frameless mode with auto-hiding controls.'
-        )
-      )
-    )
-  );
-}
-
-// ─── Remote Control Component ────────────────────────────────────────
-function RemoteControl({ onChannelUp, onChannelDown, onVolumeUp, onVolumeDown, onMute, onMenu, onFavorites, onPower, onNumber, onClose }) {
-  return h('div', {
-    className: 'fixed bottom-0 right-0 z-40 remote-panel-v2',
-  },
-
-    // Compact remote layout — no scrolling needed
-    h('div', { className: 'remote-inner' },
-
-      // Top row: power + brand + close
-      h('div', { className: 'remote-top-row' },
-        h('button', { className: 'remote-btn-sm power-remote', onClick: onPower, tabIndex: 0, title: 'Power' }, '⏻'),
-        h('div', { className: 'remote-brand' }, 'RETROVISION'),
-        h('button', { className: 'remote-close-btn', onClick: onClose, tabIndex: 0 }, '✕')
-      ),
-
-      // Middle section: D-pad + number pad side by side
-      h('div', { className: 'remote-body' },
-
-        // Left: D-pad + function row
-        h('div', { className: 'remote-left' },
-          // D-pad
-          h('div', { className: 'dpad-grid' },
-            h('div'),
-            h('button', { className: 'remote-btn-sm dpad-btn', onClick: onChannelUp, tabIndex: 0, title: 'Channel Up' }, '▲'),
-            h('div'),
-            h('button', { className: 'remote-btn-sm dpad-btn', onClick: onVolumeDown, tabIndex: 0, title: 'Volume Down' }, '◄'),
-            h('button', { className: 'remote-btn-sm dpad-ok', onClick: onMenu, tabIndex: 0, title: 'OK / Menu' }, 'OK'),
-            h('button', { className: 'remote-btn-sm dpad-btn', onClick: onVolumeUp, tabIndex: 0, title: 'Volume Up' }, '►'),
-            h('div'),
-            h('button', { className: 'remote-btn-sm dpad-btn', onClick: onChannelDown, tabIndex: 0, title: 'Channel Down' }, '▼'),
-            h('div')
-          ),
-          // Function buttons
-          h('div', { className: 'remote-fn-row' },
-            h('button', { className: 'remote-fn-btn', onClick: onMenu, tabIndex: 0 }, 'GUIDE'),
-            h('button', { className: 'remote-fn-btn', onClick: onMute, tabIndex: 0 }, 'MUTE'),
-            h('button', { className: 'remote-fn-btn', onClick: onFavorites, tabIndex: 0 }, '★ FAV')
-          )
-        ),
-
-        // Right: Number pad compact
-        h('div', { className: 'remote-right' },
-          h('div', { className: 'numpad-grid' },
-            [1,2,3,4,5,6,7,8,9,null,0,null].map((n, i) =>
-              n !== null ?
-                h('button', {
-                  key: i,
-                  className: 'remote-num-btn',
-                  onClick: () => onNumber(String(n)),
-                  tabIndex: 0
-                }, n) :
-                h('div', { key: i })
-            )
-          ),
-          // Color buttons
-          h('div', { className: 'remote-color-row' },
-            h('button', { className: 'remote-color-btn rc-red', tabIndex: 0 }),
-            h('button', { className: 'remote-color-btn rc-green', tabIndex: 0 }),
-            h('button', { className: 'remote-color-btn rc-yellow', tabIndex: 0 }),
-            h('button', { className: 'remote-color-btn rc-blue', tabIndex: 0 })
-          )
-        )
-      )
-    )
-  );
-}
-
-// ─── Mount ────────────────────────────────────────────────────────────
